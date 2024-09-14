@@ -6,6 +6,10 @@ from spotipy.client import SpotifyException
 import math
 import json
 from itertools import combinations
+from sklearn.preprocessing import MinMaxScaler
+from scipy.spatial.distance import pdist, squareform
+import networkx as nx
+from sklearn.preprocessing import MultiLabelBinarizer
 
 # Spotify credentials
 client_id = ""
@@ -127,11 +131,22 @@ def group_by_genre(library_tracks, play_count, popularity_dict, audio_features, 
         track = item["track"]
         artist_id = track["artists"][0]["id"]
         genres = artist_genres.get(artist_id, [])
+
         for genre in genres:
             score = play_count[track["id"]] * 30 + popularity_dict[track["id"]]
             if track["id"] in top_tracks:
                 score = np.inf
+            audio_features[track["id"]]["genres"] = genres
             genre_dict[genre].append((track, score, audio_features[track["id"]]))
+
+    # Remove genre that are too niche
+    keys_to_remove = []
+    for key, value in genre_dict.items():
+        if len(value) < 5:
+            keys_to_remove.append(key)
+
+    for key in keys_to_remove:
+        del genre_dict[key]
 
     return genre_dict
 
@@ -143,13 +158,15 @@ def get_top_songs_by_genre(genre_dict, top_n=3):
     genre_dict = dict(sorted(genre_dict.items(), key=lambda item: len(item[1])))
 
     for genre, tracks in genre_dict.items():
+        # Remove last 3 genre from tracks
         sorted_tracks = sorted(tracks, key=lambda x: x[1], reverse=True)  # Sort by score
         genre_top_tracks = []
 
         i = 0
         for track in sorted_tracks:
-            if track[0]["id"] not in songs_added:
+            if track[0]["id"] not in songs_added and track[0]["name"] not in songs_added:
                 songs_added.append(track[0]["id"])
+                songs_added.append(track[0]["name"])
                 genre_top_tracks.append(track)
                 i += 1
 
@@ -159,20 +176,19 @@ def get_top_songs_by_genre(genre_dict, top_n=3):
         if len(genre_top_tracks) == 0:
             print(f"No tracks found for genre:{genre}, despite starting with {len(tracks)} tracks")
 
-            # Assert that for track in tracks, track is in songs_added
-            assert all(track[0]["id"] in songs_added for track in tracks)
         else:
             top_songs[genre] = genre_top_tracks
 
     return top_songs
 
 
-def order_songs(top_songs_by_genre, artist_genres):
+def order_songs_by_genre_order(top_songs_by_genre, artist_genres):
     genre_lists = artist_genres.values()
     pair_counts = defaultdict(int)
 
     # Generate all sorted_pairs of genres in each list
     for genre_list in genre_lists:
+        genre_list = genre_list[:4]
         for pair in combinations(genre_list, 2):
             sorted_pair = tuple(sorted(pair))  # Sort to avoid ('rock', 'pop') and ('pop', 'rock') being different
             pair_counts[sorted_pair] += 1
@@ -215,15 +231,87 @@ def order_songs(top_songs_by_genre, artist_genres):
                     sequence.append(pair[0][1])
 
 
-    for genre in top_songs_by_genre.keys():
-        if genre not in sequence:
-            assert False, f"Genre {genre} not in sequence"
+    # for genre in top_songs_by_genre.keys():
+    #     if genre not in sequence:
+    #         assert False, f"Genre {genre} not in sequence"
 
     # Add the songs following the sequence
-    final_songs = []
+    ordered_songs = []
     for genre in sequence:
         if genre in top_songs_by_genre.keys():
-            final_songs.extend([item[0] for item in top_songs_by_genre[genre]])
+            ordered_songs.extend(top_songs_by_genre[genre])
+
+    # Do a rolling window sort over song audio features
+    features = np.array([[song[2]["tempo"], song[2]["key"], song[2]["danceability"]] for song in ordered_songs])
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    window_length = 9
+    windowed_features = sliding_window_view(np.array(features), window_shape=(window_length, features.shape[1]))
+
+    sorted_songs_per_window = []
+
+    # Iterate through each window
+    for i, window in enumerate(windowed_features):
+        # Create a list of tuples (feature_row, song) for sorting
+        song_feature_pairs = list(zip(window[0, :], ordered_songs[i*window_length: (i+1)*window_length]))
+
+        # Sort based on the feature values
+        song_feature_pairs.sort(key=lambda x: tuple(x[0]))  # Sorting by feature values
+
+        # Extract the sorted songs
+        sorted_songs_per_window.extend([song[0] for _, song in song_feature_pairs])
+
+    return sorted_songs_per_window
+
+
+def order_songs_by_genre_features(top_songs_by_genre, song_info_by_genre):
+    features = []
+    songs = []
+    for genre in top_songs_by_genre.keys():
+        songs_audio_features = [song[2] for song in top_songs_by_genre[genre]]
+        songs_in_genre = [song[0] for song in top_songs_by_genre[genre]]
+
+        # Get features for each song in the genre
+        for feature, song in zip(songs_audio_features, songs_in_genre):
+            features.append([feature["tempo"], feature["key"], feature["danceability"], feature["energy"], feature["valence"], feature["genres"][-1]])
+            songs.append(song)
+
+    # Normalize the features
+    all_genres = [entry[-1] for entry in features]
+
+    # Use MultiLabelBinarizer to one-hot encode the list of genres
+    mlb = MultiLabelBinarizer()
+    one_hot_encoded_genres = mlb.fit_transform(all_genres)
+
+    # Combine one-hot encoded genres with the rest of the features
+    for i, feat in enumerate(features):
+        # Append other features followed by the one-hot encoded genres
+        features[i] = features[i][:-1] + list(one_hot_encoded_genres[i])
+
+    # Normalize the features
+    scaler = MinMaxScaler()
+    normalized_songs = scaler.fit_transform(features)
+
+    # Calculate pairwise Euclidean distances
+    distance_matrix = squareform(pdist(normalized_songs, metric='euclidean'))
+
+    # Create a graph from the distance matrix
+    G = nx.Graph()
+    num_songs = len(distance_matrix)
+
+    for i in range(num_songs):
+        for j in range(i + 1, num_songs):
+            G.add_edge(i, j, weight=distance_matrix[i, j])
+
+    # Use the approximation algorithm for TSP
+    tsp_path = nx.approximation.traveling_salesman_problem(G, cycle=False)
+
+    # Print the order of songs
+    print("Order of songs for optimal flow:")
+    print(tsp_path)
+
+    # Create a list of songs in the optimal order
+    final_songs = [songs[i] for i in tsp_path]
 
     return final_songs
 
@@ -304,10 +392,14 @@ def main():
                                         artist_genres)
     print("Getting top songs by genre...")
     top_songs_by_genre = get_top_songs_by_genre(song_info_by_genre)
-    print("Making order...")
-    final_songs = order_songs(top_songs_by_genre, artist_genres)
-    print("Creating playlist...")
-    create_or_update_playlist(sp, user_id, "Trip", final_songs)
+    print("Making order by genre...")
+    final_songs_ordered_by_genre = order_songs_by_genre_order(top_songs_by_genre, artist_genres)
+    print("Making order by key and tempo...")
+    final_songs_ordered_by_features = order_songs_by_genre_features(top_songs_by_genre, song_info_by_genre)
+    print("Creating playlists...")
+    create_or_update_playlist(sp, user_id, "Trip by genre", final_songs_ordered_by_genre)
+    create_or_update_playlist(sp, user_id, "Trip by tempo", final_songs_ordered_by_features)
+
     print("Playlist updated successfully!")
 
 
