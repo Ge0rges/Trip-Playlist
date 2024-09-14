@@ -4,6 +4,8 @@ from collections import defaultdict, Counter
 import numpy as np
 from spotipy.client import SpotifyException
 import math
+import json
+from itertools import combinations
 
 # Spotify credentials
 client_id = ""
@@ -59,11 +61,11 @@ def get_track_popularity(tracks):
 
 def get_user_top_tracks(limit=50):
     """
-    Retrieve the user's top tracks.
+    Retrieve the user's top library_tracks.
 
-    :param time_range: The time range for the top tracks. Possible values: 'short_term', 'medium_term', 'long_term'.
-    :param limit: The maximum number of tracks to retrieve.
-    :return: List of top tracks.
+    :param time_range: The time range for the top library_tracks. Possible values: 'short_term', 'medium_term', 'long_term'.
+    :param limit: The maximum number of library_tracks to retrieve.
+    :return: List of top library_tracks.
     """
     results = sp.current_user_top_tracks(time_range="long_term", limit=limit)["items"]
     results += sp.current_user_top_tracks(time_range="short_term", limit=limit)["items"]
@@ -92,13 +94,12 @@ def get_audio_features(tracks):
                 results[track] = None
 
         # Sleep thread for 30 seconds
-        print(f"Processed {i + chunk_size} tracks...")
+        print(f"Processed {i + chunk_size} library_tracks...")
 
     return results
 
 
-def group_by_genre(tracks, play_count, popularity_dict, audio_features, top_tracks):
-    genre_dict = defaultdict(list)
+def get_artist_genres(tracks):
     artist_ids = {track["track"]["artists"][0]["id"] for track in tracks}
 
     # Split artist IDs into batches of 100
@@ -115,13 +116,19 @@ def group_by_genre(tracks, play_count, popularity_dict, audio_features, top_trac
         for artist in artists_info["artists"]:
             artist_genres[artist["id"]] = artist["genres"]
 
-    # Iterate over tracks and group by genre
-    for item in tracks:
+    return artist_genres
+
+
+def group_by_genre(library_tracks, play_count, popularity_dict, audio_features, top_tracks, artist_genres):
+    genre_dict = defaultdict(list)
+
+    # Iterate over library_tracks and group by genre
+    for item in library_tracks:
         track = item["track"]
         artist_id = track["artists"][0]["id"]
         genres = artist_genres.get(artist_id, [])
         for genre in genres:
-            score = play_count[track["id"]] * 2 + popularity_dict[track["id"]]
+            score = play_count[track["id"]] * 30 + popularity_dict[track["id"]]
             if track["id"] in top_tracks:
                 score = np.inf
             genre_dict[genre].append((track, score, audio_features[track["id"]]))
@@ -129,78 +136,96 @@ def group_by_genre(tracks, play_count, popularity_dict, audio_features, top_trac
     return genre_dict
 
 
-def calculate_genre_ambiance(genre_tracks):
-    valence = 0
-    energy = 0
-    for track in genre_tracks:
-        if track[2] is None:
-            return 0.5, 0.5
-
-        energy += track[2]["energy"]
-        valence += track[2]["valence"]
-
-    return valence / len(genre_tracks), energy / len(genre_tracks)
-
-
 def get_top_songs_by_genre(genre_dict, top_n=3):
-    top_songs = []
-    genre_ambiance = {}
+    songs_added = []
+    top_songs = {}
+
+    genre_dict = dict(sorted(genre_dict.items(), key=lambda item: len(item[1])))
 
     for genre, tracks in genre_dict.items():
-        sorted_tracks = sorted(tracks, key=lambda x: x[1], reverse=True)
-        top_tracks = []
+        sorted_tracks = sorted(tracks, key=lambda x: x[1], reverse=True)  # Sort by score
+        genre_top_tracks = []
 
         i = 0
         for track in sorted_tracks:
-            if track[0] not in top_songs:
-                top_songs.append(track[0])
-                top_tracks.append(track)
+            if track[0]["id"] not in songs_added:
+                songs_added.append(track[0]["id"])
+                genre_top_tracks.append(track)
                 i += 1
 
             if i == top_n:
                 break
 
-        if len(top_tracks) > 0:
-            genre_ambiance[genre] = calculate_genre_ambiance(top_tracks)
+        if len(genre_top_tracks) == 0:
+            print(f"No tracks found for genre:{genre}, despite starting with {len(tracks)} tracks")
 
-    # Sort genres by ambiance (valence, then energy)
-    sorted_genres = sorted(genre_ambiance.items(), key=lambda x: (x[1][0], x[1][1]))
-    sorted_top_songs = [track[0] for genre in sorted_genres for track in genre_dict[genre[0]][:top_n]]
+            # Assert that for track in tracks, track is in songs_added
+            assert all(track[0]["id"] in songs_added for track in tracks)
+        else:
+            top_songs[genre] = genre_top_tracks
 
-    return sorted_top_songs
+    return top_songs
 
 
-def smooth_transitions(tracks):
-    # Fetch audio features for all tracks at once
-    track_ids = [track["id"] for track in tracks]
-    audio_features_list = sp.audio_features(track_ids)
+def order_songs(top_songs_by_genre, artist_genres):
+    genre_lists = artist_genres.values()
+    pair_counts = defaultdict(int)
 
-    # Create list of tuples with track and its corresponding audio features
-    tracks_with_features = [
-        (track, features) for track, features in zip(tracks, audio_features_list) if features
-    ]
+    # Generate all sorted_pairs of genres in each list
+    for genre_list in genre_lists:
+        for pair in combinations(genre_list, 2):
+            sorted_pair = tuple(sorted(pair))  # Sort to avoid ('rock', 'pop') and ('pop', 'rock') being different
+            pair_counts[sorted_pair] += 1
 
-    # Step 1: Group the tracks into groups of 3 (assuming len(tracks) % 3 == 0)
-    grouped_tracks = [tracks_with_features[i:i + 3] for i in range(0, len(tracks_with_features), 3)]
+        if len(genre_list) == 1:
+            pair_counts[(genre_list[0], genre_list[0])] += 1
 
-    # Step 2: Sort within each group of 3 by tempo and key
-    sorted_within_groups = [
-        sorted(group, key=lambda x: (x[1].get("tempo", 0), x[1].get("key", 0))) for group in grouped_tracks
-    ]
+    # Sort sorted_pairs by frequency in descending order
+    sorted_pairs = sorted(pair_counts.items(), key=lambda x: -x[1])
 
-    # Step 3: Sort groups based on the average tempo and key of the group
-    sorted_groups = sorted(
-        sorted_within_groups,
-        key=lambda group: (
-            sum(track[1].get("tempo", 0) for track in group) / len(group),
-            sum(track[1].get("key", 0) for track in group) / len(group)
-        )
-    )
+    # Create a sequence of genres
+    sequence = list(sorted_pairs[0][0])
 
-    # Flatten the sorted list of groups back into a single list of tracks
-    final_sorted_tracks = [track[0] for group in sorted_groups for track in group]
+    for pair in sorted_pairs[1:]:
+        added = False
 
-    return final_sorted_tracks
+        for i, genre in enumerate(sequence):
+            if pair[0][0] == genre:
+                if pair[0][1] not in sequence:
+                    j = i + 1
+                    while j < len(sequence) and (genre, sequence[j]) in sorted_pairs:
+                        j += 1
+                    sequence.insert(j, pair[0][1])
+                    added = True
+                    break
+
+            if pair[0][1] == genre:
+                if pair[0][0] not in sequence:
+                    j = i + 1
+                    while j < len(sequence) and (genre, sequence[j]) in sorted_pairs:
+                        j += 1
+                    sequence.insert(j, pair[0][0])
+                    added = True
+                    break
+
+        if not added:
+            if pair[0][0] not in sequence and pair[0][1] not in sequence:
+                sequence.append(pair[0][0])
+                if pair[0][0] != pair[0][1]:
+                    sequence.append(pair[0][1])
+
+
+    for genre in top_songs_by_genre.keys():
+        if genre not in sequence:
+            assert False, f"Genre {genre} not in sequence"
+
+    # Add the songs following the sequence
+    final_songs = []
+    for genre in sequence:
+        if genre in top_songs_by_genre.keys():
+            final_songs.extend([item[0] for item in top_songs_by_genre[genre]])
+
+    return final_songs
 
 
 def create_or_update_playlist(sp, user_id, playlist_name, tracks):
@@ -213,40 +238,76 @@ def create_or_update_playlist(sp, user_id, playlist_name, tracks):
             break
 
     if playlist_id:
-        sp.playlist_replace_items(playlist_id, [])
+        track_uris = [track["uri"] for track in tracks]
+        num_batches = math.ceil(len(track_uris) / 50)
+
+        sp.playlist_replace_items(playlist_id, track_uris[0:50])
+
+        for i in range(1, num_batches):
+            batch = track_uris[i * 50: (i + 1) * 50]
+            sp.playlist_add_items(playlist_id, batch)
+
     else:
         playlist_id = sp.user_playlist_create(user_id, playlist_name)["id"]
 
-    track_uris = [track["uri"] for track in tracks]
-    num_batches = math.ceil(len(track_uris) / 50)
-    for i in range(num_batches):
-        batch = track_uris[i * 50 : (i + 1) * 50]
-        sp.playlist_add_items(playlist_id, batch)
+        track_uris = [track["uri"] for track in tracks]
+        num_batches = math.ceil(len(track_uris) / 50)
+        for i in range(num_batches):
+            batch = track_uris[i * 50: (i + 1) * 50]
+            sp.playlist_add_items(playlist_id, batch)
 
 
 def main():
-    print("Getting user ID...")
-    user_id = sp.current_user()["id"]
-    print("Getting library...")
-    library_tracks = get_user_library()
-    print("Getting recently played...")
-    recently_played = get_recently_played()
+    # Check if the JSON file exists
+    try:
+        with open("all_data.json", "r") as f:
+            all_data = json.load(f)
+            user_id = all_data["user_id"]
+            library_tracks = all_data["library_tracks"]
+            popularity_dict = all_data["popularity_dict"]
+            top_tracks = all_data["top_tracks"]
+            audio_features_dict = all_data["audio_features_dict"]
+            artist_genres = all_data["artist_genres"]
+            recently_played = all_data["recently_played"]
+
+    except FileNotFoundError:
+        print("Getting user ID...")
+        user_id = sp.current_user()["id"]
+        print("Getting library...")
+        library_tracks = get_user_library()
+        print("Getting recently played...")
+        recently_played = get_recently_played()
+        print("Getting popularity...")
+        popularity_dict = get_track_popularity([item["track"] for item in library_tracks])
+        print("Getting top songs...")
+        top_tracks = get_user_top_tracks()
+        print("Getting audio features...")
+        audio_features_dict = get_audio_features([item["track"] for item in library_tracks])
+        print("Getting artist genres...")
+        artist_genres = get_artist_genres(library_tracks)
+
+        # Write everything to a JSON file
+        with open("all_data.json", "w") as f:
+            all_data = {"user_id": user_id,
+                        "library_tracks": library_tracks,
+                        "popularity_dict": popularity_dict,
+                        "recently_played": recently_played,
+                        "top_tracks": top_tracks,
+                        "audio_features_dict": audio_features_dict,
+                        "artist_genres": artist_genres}
+            json.dump(all_data, f)
+
     print("Getting counts...")
     play_count = count_plays(recently_played)
-    print("Getting popularity...")
-    popularity_dict = get_track_popularity([item["track"] for item in library_tracks])
-    print("Getting top songs...")
-    top_tracks = get_user_top_tracks()
-    print("Getting audio features...")
-    audio_features_dict = get_audio_features([item["track"] for item in library_tracks])
     print("Grouping track features...")
-    genre_dict = group_by_genre(library_tracks, play_count, popularity_dict, audio_features_dict, top_tracks)
+    song_info_by_genre = group_by_genre(library_tracks, play_count, popularity_dict, audio_features_dict, top_tracks,
+                                        artist_genres)
     print("Getting top songs by genre...")
-    top_songs = get_top_songs_by_genre(genre_dict)
-    print("Getting smooth transitions...")
-    smoothed_top_songs = smooth_transitions(top_songs)
+    top_songs_by_genre = get_top_songs_by_genre(song_info_by_genre)
+    print("Making order...")
+    final_songs = order_songs(top_songs_by_genre, artist_genres)
     print("Creating playlist...")
-    create_or_update_playlist(sp, user_id, "Trip", smoothed_top_songs)
+    create_or_update_playlist(sp, user_id, "Trip", final_songs)
     print("Playlist updated successfully!")
 
 
